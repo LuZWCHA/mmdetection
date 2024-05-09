@@ -1,28 +1,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-import inspect
-import math
-import warnings
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Union
 
-import cv2
 import mmcv
 import numpy as np
-from mmcv.image import imresize
-from mmcv.image.geometric import _scale_size
 from mmcv.transforms import BaseTransform
-from mmcv.transforms import Pad as MMCV_Pad
-from mmcv.transforms import RandomFlip as MMCV_RandomFlip
-from mmcv.transforms import Resize as MMCV_Resize
-from mmcv.transforms.utils import avoid_cache_randomness, cache_randomness
-from mmengine.dataset import BaseDataset
-from mmengine.utils import is_str
+from mmcv.transforms.utils import cache_randomness
 from numpy import random
 
 from mmdet.registry import TRANSFORMS
-from mmdet.structures.bbox import HorizontalBoxes, autocast_box_type
-from mmdet.structures.mask import BitmapMasks, PolygonMasks
-from mmdet.utils import log_img_scale
+from mmdet.structures.bbox import autocast_box_type
+from .transforms import Mosaic
 
 try:
     from imagecorruptions import corrupt
@@ -38,7 +26,6 @@ except ImportError:
 
 Number = Union[int, float]
 
-from .transforms import Mosaic
 
 @TRANSFORMS.register_module()
 class CachedMosaic2Images(Mosaic):
@@ -180,7 +167,7 @@ class CachedMosaic2Images(Mosaic):
                 (int(self.img_scale[1] * 2), int(self.img_scale[0] * 2), 3),
                 self.pad_val,
                 dtype=results['img2'].dtype)
-            
+
         else:
             mosaic_img = np.full(
                 (int(self.img_scale[1] * 2), int(self.img_scale[0] * 2)),
@@ -213,25 +200,23 @@ class CachedMosaic2Images(Mosaic):
                                 self.img_scale[0] / w_i)
             img_i = mmcv.imresize(
                 img_i, (int(w_i * scale_ratio_i), int(h_i * scale_ratio_i)))
-            
 
             # compute the combine parameters
             paste_coord, crop_coord = self._mosaic_combine(
                 loc, center_position, img_i.shape[:2][::-1])
-            
+
             x1_p, y1_p, x2_p, y2_p = paste_coord
             x1_c, y1_c, x2_c, y2_c = crop_coord
 
             # crop and paste image
             mosaic_img[y1_p:y2_p, x1_p:x2_p] = img_i[y1_c:y2_c, x1_c:x2_c]
-            
-            
+
             img_i2 = mmcv.imresize(
                 img_i2, (int(w_i * scale_ratio_i), int(h_i * scale_ratio_i)))
-                        # compute the combine parameters
+            # compute the combine parameters
             paste_coord2, crop_coord2 = self._mosaic_combine(
                 loc, center_position, img_i2.shape[:2][::-1])
-            
+
             x1_p, y1_p, x2_p, y2_p = paste_coord2
             x1_c, y1_c, x2_c, y2_c = crop_coord2
             mosaic_img2[y1_p:y2_p, x1_p:x2_p] = img_i2[y1_c:y2_c, x1_c:x2_c]
@@ -298,4 +283,82 @@ class CachedMosaic2Images(Mosaic):
         repr_str += f'max_cached_images={self.max_cached_images}, '
         repr_str += f'random_pop={self.random_pop})'
         return repr_str
-    
+
+
+@TRANSFORMS.register_module()
+class BndboxShift(BaseTransform):
+    """Shift the box given shift pixels and probability.
+
+    Required Keys:
+
+    - img
+    - gt_bboxes (BaseBoxes[torch.float32])
+
+    Modified Keys:
+
+    - img
+    - gt_bboxes
+
+    Args:
+        prob (float): Probability of shifts. Defaults to 0.5.
+        max_shift_px (int): The max pixels for shifting. Defaults to 32.
+        filter_thr_px (int): The width and height threshold for filtering.
+            The bbox and the rest of the targets below the width and
+            height threshold will be filtered. Defaults to 1.
+        unchange_thr_px (int): The width and height threshold for unchanging.
+    """
+
+    def __init__(self,
+                 prob: float = 0.5,
+                 max_shift_px: int = 32,
+                 filter_thr_px: int = 1,
+                 unchange_thr_px: int = 32) -> None:
+        assert 0 <= prob <= 1
+        assert max_shift_px >= 0
+        self.prob = prob
+        self.max_shift_px = max_shift_px
+        self.filter_thr_px = int(filter_thr_px)
+        self.unchange_thr_px = int(unchange_thr_px)
+
+    @cache_randomness
+    def _random_prob(self) -> float:
+        return random.uniform(0, 1)
+
+    @autocast_box_type()
+    def transform(self, results: dict) -> dict:
+        """Transform function to random shift bounding boxes.
+
+        Args:
+            results (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Shift results.
+        """
+        gt_bboxes = results['gt_bboxes']
+        img_shape = results['img'].shape[:2]
+
+        for i in range(len(gt_bboxes)):
+            gt_bbox = gt_bboxes[i].clone()
+
+            if (gt_bbox.cxcywh[0, 2:]).min() > self.unchange_thr_px and self._random_prob() < self.prob:
+                random_shift_x = random.randint(-self.max_shift_px,
+                                                self.max_shift_px)
+                random_shift_y = random.randint(-self.max_shift_px,
+                                                self.max_shift_px)
+                gt_bbox.translate_([random_shift_x, random_shift_y])
+
+                # clip border
+                gt_bbox.clip_(img_shape)
+
+                if gt_bbox.cxcywh[0, 2:].min() > self.filter_thr_px:
+                    gt_bboxes[i] = gt_bbox
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(prob={self.prob}, '
+        repr_str += f'max_shift_px={self.max_shift_px}, '
+        repr_str += f'filter_thr_px={self.filter_thr_px}, '
+        repr_str += f'unchange_thr_px={self.unchange_thr_px})'
+        return repr_str
+
